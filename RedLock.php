@@ -91,7 +91,7 @@ class RedLock {
         $result = array_combine(array_keys($defaults), array_slice($cfg + array_values($defaults), 0, count($defaults)));
         $result['instance'] = null;
         break;
-      case is_a($cfg, 'stdClass'):
+      case is_a($cfg, '\\stdClass'):
         $result = ((array) $cfg) + $defaults;
         $result['instance'] = null;
         break;
