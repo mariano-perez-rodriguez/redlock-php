@@ -508,11 +508,3 @@ class RedLock {
     return $result;
   }
 }
-
-$rl = new RedLock([[]], 200, 3, 0.01, true);
-var_dump($rl);
-var_dump("LOCK", $l = $rl->lock("hola"));
-var_dump("EXTEND", $rl->extend($l));
-var_dump("WITH", $rl->with("hola", function ($r) { var_dump($r); return 42; }));
-var_dump("UNLOCK", $rl->unlock($l));
-var_dump("WITH", $rl->with("hola", function ($r) { var_dump($r); return 42; }));
