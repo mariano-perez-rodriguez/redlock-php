@@ -4,7 +4,13 @@
  * RedLock (http://redis.io/topics/distlock) implementation
  *
  */
-class RedLock {
+namespace RedLock;
+
+/**
+ * RedLock Service implementation
+ *
+ */
+class Service {
   /**
    * Lua unlocking script
    *
@@ -309,7 +315,7 @@ class RedLock {
   }
 
   /**
-   * Initialize a RedLock instance
+   * Initialize a RedLock Service instance
    *
    * @param array $servers  Server configurations to use
    * @param int $retryDelay  Delay to apply during retries
@@ -369,8 +375,8 @@ class RedLock {
    * @param string $resource  Resource to acquire a lock for
    * @param int $ttl  TTL to associate to the lock
    * @param string $token  Token to use for the lock (if none given, create a new one)
-   * @return array|false  Returns an array with 'resource', 'token', and 'validity' keys if successful, false otherwise
-   * @throws \Exception  In case no quorum achieved or malformed ttl
+   * @return \RedLock\Lease|false  Returns a RedLock Lease if successful, false otherwise
+   * @throws \Exception  In case no quorum achieved on init or malformed ttl
    */
   public function lock($resource, $ttl = 500, $token = null) {
     // sanitize ttl
@@ -388,7 +394,6 @@ class RedLock {
     }
 
     // set everything up for main cycle
-    $lock  = ['resource' => $resource, 'token' => $token];
     $retry = $this->retryCount;
     do {
       // save starting time and apply callback to all instances
@@ -400,15 +405,15 @@ class RedLock {
       # for small TTLs.
       $drift = ($ttl * $this->clockDriftFactor) + 2;
 
-      $validityTime = $ttl - (static::msecs() - $startTime) - $drift;
+      $validityTime = (int) ($ttl - (static::msecs() - $startTime) - $drift);
 
       // if quorum achieved and time remaining, return
       if ($this->quorum <= $n && 0 < $validityTime) {
-        return $lock + ['validity' => $validityTime];
+        return new \RedLock\Lease($this, $resource, $token, static::msecs() + $validityTime);
       }
 
       // otherwise, clean up
-      $this->unlock($lock);
+      $this->forAllInstaces([__CLASS__, 'doUnlock'], $resource, $token);
 
       // Wait a random delay before to retry
       usleep(mt_rand(floor($this->retryDelay / 2), $this->retryDelay) * 1000);
@@ -421,44 +426,29 @@ class RedLock {
   /**
    * Free a previously acquired lock
    *
-   * @param array $lock  A lock array with keys 'resource' and 'token'
+   * @param \RedLock\Lease $lease  A RedLock lease
    * @return boolean  Whether quorum was reached regarding the freeing of the lock
-   * @throws \Exception  In case no quorum achieved or malformed lock
+   * @throws \Exception  In case no quorum achieved on init
    */
-  public function unlock(array $lock) {
-    // sanitize lock
-    if (!array_key_exists('resource', $lock)) {
-      throw new \Exception("Missing 'resource'");
-    }
-    if (!array_key_exists('token', $lock)) {
-      throw new \Exception("Missing 'token'");
-    }
-
+  public function unlock(\RedLock\Lease $lease) {
     // try to initialize and get quorum
     if ($this->init() < $this->quorum) {
       throw new \Exception("No quorum");
     }
 
     // apply callback to all instances and return whether quorum was reached
-    return $this->quorum <= $this->forAllInstaces([__CLASS__, 'doUnlock'], $lock['resource'], $lock['token']);
+    return $this->quorum <= $this->forAllInstaces([__CLASS__, 'doUnlock'], $lease->resource(), $lease->token());
   }
 
   /**
    * Extend the TTL on a previously acquired lock
    *
-   * @param array $lock  A lock array with keys 'resource' and 'token'
+   * @param \RedLock\Lease $lease  A RedLock lease
    * @param int $ttl  New TTL to use
    * @return boolean  Whether quorum was reached regarding the extension of the lock
-   * @throws \Exception  In case no quorum achieved or malformed lock or ttl
+   * @throws \Exception  In case no quorum achieved on init
    */
-  public function extend(array $lock, $ttl = 500) {
-    // sanitize lock
-    if (!array_key_exists('resource', $lock)) {
-      throw new \Exception("Missing 'resource'");
-    }
-    if (!array_key_exists('token', $lock)) {
-      throw new \Exception("Missing 'token'");
-    }
+  public function extend(\RedLock\Lease $lease, $ttl = 500) {
     // sanitize ttl
     if (($ttl = ((int) $ttl) ?: 500) < 0) {
       throw new \Exception("TTL must be non-negative");
@@ -470,7 +460,7 @@ class RedLock {
     }
 
     // apply callback to all instances and return whether quorum was reached
-    return $this->quorum <= $this->forAllInstaces([__CLASS__, 'doExtend'], $lock['resource'], $lock['token'], $ttl);
+    return $this->quorum <= $this->forAllInstaces([__CLASS__, 'doExtend'], $lease->resource(), $lease->token(), $ttl);
   }
 
   /**
@@ -506,5 +496,133 @@ class RedLock {
     }
 
     return $result;
+  }
+}
+
+/**
+ * RedLock Lease implementation
+ *
+ */
+class Lease {
+  /**
+   * Whether this lease is still valid
+   *
+   * @var bool
+   */
+  protected $valid;
+
+  /**
+   * The underlying RedLock Service to use
+   *
+   * @var \RedLock\Service
+   */
+  protected $service;
+
+  /**
+   * The resource this Lease locks
+   *
+   * @var string
+   */
+  protected $resource;
+
+  /**
+   * The token used to lock the resource for this lease
+   *
+   * @var string
+   */
+  protected $token;
+
+  /**
+   * The expiry moment in milliseconds since the epoch
+   *
+   * @var int
+   */
+  protected $expiry;
+
+  /**
+   * Construct a new Lease instance
+   *
+   * @param \RedLock\Service $service  Underlying RedLock Service to use
+   * @param string $resource  Resource this lease locks
+   * @param string token  Random token this lease uses to lock
+   * @param int $expiry  Expiry moment in milliseconds since the epoch
+   */
+  public function __construct(\RedLock\Service $service, $resource, $token, $expiry) {
+    $this->valid    = true;
+    $this->service  = $service;
+    $this->resource = $resource;
+    $this->token    = $token;
+    $this->expiry   = $expiry;
+  }
+
+  /**
+   * Release the lock and invalidate the lease
+   *
+   * @return boolean  Whatever \RedLock\Service::unlock() returns, or false if invalid lease
+   */
+  public function release() {
+    if (!$this->valid) {
+      return false;
+    }
+    $this->valid = false;
+    return $this->service->unlock($this);
+  }
+
+  /**
+   * Extend the lock
+   *
+   * @param int $ttl  New TTL to use
+   * @return boolean  Whatever \RedLock\Service::unlock() returns, or false if invalid lease
+   */
+  public function extend($ttl = 500) {
+    if (!$this->valid) {
+      return false;
+    }
+    return $this->service->extend($this, $ttl);
+  }
+
+  /**
+   * Determine whether the lease is still valid
+   *
+   * @return bool  True if the lease is still valid, false otherwise
+   */
+  public function valid() {
+    return $this->valid;
+  }
+
+  /**
+   * Return the underlying RedLock\Service
+   *
+   * @return \RedLock\Service The underlying RedLock Service
+   */
+  public function service() {
+    return $this->service;
+  }
+
+  /**
+   * Return the resource being locked
+   *
+   * @return string  The resource being locked
+   */
+  public function resource() {
+    return $this->resource;
+  }
+
+  /**
+   * Return the token being used for locking
+   *
+   * @return string  The token being used for locking
+   */
+  public function token() {
+    return $this->token;
+  }
+
+  /**
+   * Return the expiry moment in milliseconds since the epoch
+   *
+   * @return int  Expiry moment
+   */
+  public function expiry() {
+    return $this->expiry;
   }
 }
